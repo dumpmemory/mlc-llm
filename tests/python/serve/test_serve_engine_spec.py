@@ -1,20 +1,13 @@
 # pylint: disable=chained-comparison,line-too-long,missing-docstring,
-# pylint: disable=too-many-arguments,too-many-locals,unused-argument,unused-variable
+# pylint: disable=too-many-arguments,too-many-locals
 from typing import Callable, List, Optional
 
 import numpy as np
 
-from mlc_llm.serve import (
-    EngineConfig,
-    GenerationConfig,
-    KVCacheConfig,
-    Request,
-    RequestStreamOutput,
-    SpeculativeMode,
-    data,
-)
-from mlc_llm.serve.engine_base import ModelInfo
-from mlc_llm.serve.sync_engine import SyncEngine
+from mlc_llm.protocol.generation_config import GenerationConfig
+from mlc_llm.serve import Request, RequestStreamOutput, data
+from mlc_llm.serve.sync_engine import EngineConfig, SyncMLCEngine
+from mlc_llm.testing import require_test_model
 
 prompts = [
     "What is the meaning of life?",
@@ -59,7 +52,11 @@ def create_requests(
     return requests
 
 
-def test_engine_basic():
+@require_test_model(
+    "Llama-2-7b-chat-hf-q0f16-MLC",
+    "Llama-2-7b-chat-hf-q4f16_1-MLC",
+)
+def test_engine_basic(model: str, small_model: str):
     """Test engine **without continuous batching**.
 
     - Add all requests to the engine altogether in the beginning.
@@ -77,7 +74,7 @@ def test_engine_basic():
     np.random.seed(0)
 
     # Output list
-    outputs = [[] for _ in range(num_requests)]
+    outputs: List[List[int]] = [[] for _ in range(num_requests)]
 
     # Define the callback function for request generation results
     def fcallback(delta_outputs: List[RequestStreamOutput]):
@@ -87,19 +84,14 @@ def test_engine_basic():
             outputs[int(request_id)] += stream_outputs[0].delta_token_ids
 
     # Create engine
-    model = "dist/Llama-2-7b-chat-hf-q0f16-MLC"
-    model_lib_path = "dist/Llama-2-7b-chat-hf-q0f16-MLC/Llama-2-7b-chat-hf-q0f16-MLC-cuda.so"
-    small_model = "dist/Llama-2-7b-chat-hf-q4f16_1-MLC"
-    small_model_lib_path = (
-        "dist/Llama-2-7b-chat-hf-q4f16_1-MLC/Llama-2-7b-chat-hf-q4f16_1-MLC-cuda.so"
-    )
-    engine = SyncEngine(
+    engine = SyncMLCEngine(
         model=model,
-        model_lib_path=model_lib_path,
         mode="server",
-        max_total_sequence_length=4096,
-        additional_models=[small_model + ":" + small_model_lib_path],
-        engine_config=EngineConfig(speculative_mode=SpeculativeMode.SMALL_DRAFT),
+        engine_config=EngineConfig(
+            max_total_sequence_length=4096,
+            additional_models=[small_model],
+            speculative_mode="small_draft",
+        ),
         request_stream_callback=fcallback,
     )
 
@@ -126,7 +118,8 @@ def test_engine_basic():
         print(f"Output {req_id}:{engine.tokenizer.decode(output)}\n")
 
 
-def test_engine_eagle_basic():
+@require_test_model("Llama-2-7b-chat-hf-q0f16-MLC")
+def test_engine_eagle_basic(model: str):
     """Test engine **without continuous batching**.
 
     - Add all requests to the engine altogether in the beginning.
@@ -145,7 +138,7 @@ def test_engine_eagle_basic():
     np.random.seed(0)
 
     # Output list
-    outputs = [[] for _ in range(num_requests)]
+    outputs: List[List[int]] = [[] for _ in range(num_requests)]
 
     # Define the callback function for request generation results
     def fcallback(delta_outputs: List[RequestStreamOutput]):
@@ -155,19 +148,17 @@ def test_engine_eagle_basic():
             outputs[int(request_id)] += stream_outputs[0].delta_token_ids
 
     # Create engine
-    model = "dist/Llama-2-7b-chat-hf-q0f16-MLC"
-    model_lib_path = "dist/Llama-2-7b-chat-hf-q0f16-MLC/Llama-2-7b-chat-hf-q0f16-MLC-cuda.so"
     small_model = "dist/Eagle-llama2-7b-chat-q0f16-MLC"
-    small_model_lib_path = (
-        "dist/Eagle-llama2-7b-chat-q0f16-MLC/Eagle-llama2-7b-chat-q0f16-MLC-cuda.so"
-    )
-    engine = SyncEngine(
+    small_model_lib = "dist/Eagle-llama2-7b-chat-q0f16-MLC/Eagle-llama2-7b-chat-q0f16-MLC-cuda.so"
+    engine = SyncMLCEngine(
         model=model,
-        model_lib_path=model_lib_path,
         mode="server",
-        max_total_sequence_length=4096,
-        additional_models=[small_model + ":" + small_model_lib_path],
-        engine_config=EngineConfig(spec_draft_length=2, speculative_mode=SpeculativeMode.EAGLE),
+        engine_config=EngineConfig(
+            max_total_sequence_length=4096,
+            additional_models=[(small_model, small_model_lib)],
+            speculative_mode="eagle",
+            spec_draft_length=2,
+        ),
         request_stream_callback=fcallback,
     )
 
@@ -194,7 +185,11 @@ def test_engine_eagle_basic():
         print(f"Output {req_id}:{engine.tokenizer.decode(output)}\n")
 
 
-def test_engine_continuous_batching_1():
+@require_test_model(
+    "Llama-2-7b-chat-hf-q0f16-MLC",
+    "Llama-2-7b-chat-hf-q4f16_1-MLC",
+)
+def test_engine_continuous_batching_1(model: str, small_model: str):
     """Test engine **with continuous batching**.
 
     - Add all requests to the engine altogether in the beginning.
@@ -214,8 +209,8 @@ def test_engine_continuous_batching_1():
     np.random.seed(0)
 
     # Output list
-    outputs = [[] for _ in range(num_requests)]
-    finish_time = [None] * num_requests
+    outputs: List[List[int]] = [[] for _ in range(num_requests)]
+    finish_time: List[Optional[int]] = [None] * num_requests
 
     # Define the callback class for request generation results
     class CallbackTimer:
@@ -237,20 +232,15 @@ def test_engine_continuous_batching_1():
             self.timer += 1
 
     # Create engine
-    model = "dist/Llama-2-7b-chat-hf-q0f16-MLC"
-    model_lib_path = "dist/Llama-2-7b-chat-hf-q0f16-MLC/Llama-2-7b-chat-hf-q0f16-MLC-cuda.so"
-    small_model = "dist/Llama-2-7b-chat-hf-q4f16_1-MLC"
-    small_model_lib_path = (
-        "dist/Llama-2-7b-chat-hf-q4f16_1-MLC/Llama-2-7b-chat-hf-q4f16_1-MLC-cuda.so"
-    )
     timer = CallbackTimer()
-    engine = SyncEngine(
+    engine = SyncMLCEngine(
         model=model,
-        model_lib_path=model_lib_path,
         mode="server",
-        max_total_sequence_length=4096,
-        additional_models=[small_model + ":" + small_model_lib_path],
-        engine_config=EngineConfig(speculative_mode=SpeculativeMode.SMALL_DRAFT),
+        engine_config=EngineConfig(
+            max_total_sequence_length=4096,
+            additional_models=[small_model],
+            speculative_mode="small_draft",
+        ),
         request_stream_callback=timer.callback_getter(),
     )
 
@@ -280,7 +270,8 @@ def test_engine_continuous_batching_1():
         # assert fin_time == request.generation_config.max_tokens - 1
 
 
-def test_engine_eagle_continuous_batching_1():
+@require_test_model("Llama-2-7b-chat-hf-q4f16_1-MLC")
+def test_engine_eagle_continuous_batching_1(model: str):
     """Test engine **with continuous batching**.
 
     - Add all requests to the engine altogether in the beginning.
@@ -300,8 +291,8 @@ def test_engine_eagle_continuous_batching_1():
     np.random.seed(0)
 
     # Output list
-    outputs = [[] for _ in range(num_requests)]
-    finish_time = [None] * num_requests
+    outputs: List[List[int]] = [[] for _ in range(num_requests)]
+    finish_time: List[Optional[int]] = [None] * num_requests
 
     # Define the callback class for request generation results
     class CallbackTimer:
@@ -323,20 +314,19 @@ def test_engine_eagle_continuous_batching_1():
             self.timer += 1
 
     # Create engine
-    model = "dist/Llama-2-7b-chat-hf-q4f16_1-MLC"
-    model_lib_path = "dist/Llama-2-7b-chat-hf-q4f16_1-MLC/Llama-2-7b-chat-hf-q4f16_1-MLC-cuda.so"
     small_model = "dist/Eagle-llama2-7b-chat-q4f16_1-MLC"
-    small_model_lib_path = (
+    small_model_lib = (
         "dist/Eagle-llama2-7b-chat-q4f16_1-MLC/Eagle-llama2-7b-chat-q4f16_1-MLC-cuda.so"
     )
     timer = CallbackTimer()
-    engine = SyncEngine(
+    engine = SyncMLCEngine(
         model=model,
-        model_lib_path=model_lib_path,
         mode="server",
-        max_total_sequence_length=4096,
-        additional_models=[small_model + ":" + small_model_lib_path],
-        engine_config=EngineConfig(speculative_mode=SpeculativeMode.EAGLE),
+        engine_config=EngineConfig(
+            max_total_sequence_length=4096,
+            additional_models=[(small_model, small_model_lib)],
+            speculative_mode="eagle",
+        ),
         request_stream_callback=timer.callback_getter(),
     )
 
@@ -366,30 +356,64 @@ def test_engine_eagle_continuous_batching_1():
         # assert fin_time == request.generation_config.max_tokens - 1
 
 
-def test_engine_generate():
+def compare_output_text(output_text1, output_text2):
+    if isinstance(output_text1, list) and isinstance(output_text2, list):
+        for item1, item2 in zip(output_text1, output_text2):
+            if not compare_output_text(item1, item2):
+                return False
+    elif output_text1 != output_text2:
+        print(output_text1)
+        print(output_text2)
+        return False
+    return True
+
+
+@require_test_model(
+    "Llama-2-7b-chat-hf-q0f16-MLC",
+    "Llama-2-7b-chat-hf-q4f16_1-MLC",
+)
+def test_engine_generate(model: str, small_model: str, compare_precision=False):
     # Create engine
-    model = "dist/Llama-2-7b-chat-hf-q0f16-MLC"
-    model_lib_path = "dist/Llama-2-7b-chat-hf-q0f16-MLC/Llama-2-7b-chat-hf-q0f16-MLC-cuda.so"
-    small_model = "dist/Llama-2-7b-chat-hf-q4f16_1-MLC"
-    small_model_lib_path = (
-        "dist/Llama-2-7b-chat-hf-q4f16_1-MLC/Llama-2-7b-chat-hf-q4f16_1-MLC-cuda.so"
-    )
-    engine = SyncEngine(
+    engine = SyncMLCEngine(
         model=model,
-        model_lib_path=model_lib_path,
         mode="server",
-        max_total_sequence_length=4096,
-        additional_models=[small_model + ":" + small_model_lib_path],
-        engine_config=EngineConfig(speculative_mode=SpeculativeMode.SMALL_DRAFT),
+        engine_config=EngineConfig(
+            max_total_sequence_length=4096,
+            additional_models=[small_model],
+            speculative_mode="small_draft",
+        ),
     )
 
     num_requests = 10
     max_tokens = 256
 
     # Generate output.
-    output_texts, _ = engine.generate(
-        prompts[:num_requests], GenerationConfig(max_tokens=max_tokens, n=3)
-    )
+    if compare_precision:
+        print("compare precision")
+        generation_config = GenerationConfig(
+            temperature=0.0, top_p=0, max_tokens=1024, stop_token_ids=[2], n=1
+        )
+        engine_single_model = SyncMLCEngine(
+            model=model,
+            mode="server",
+            engine_config=EngineConfig(
+                max_total_sequence_length=4096,
+            ),
+        )
+        output_texts_single_model, _ = engine_single_model.generate(
+            prompts[:num_requests], generation_config
+        )
+        for req_id, outputs in enumerate(output_texts_single_model):
+            print(f"Prompt {req_id}: {prompts[req_id]}")
+            if len(outputs) == 1:
+                print(f"Output {req_id}:{outputs[0]}\n")
+            else:
+                for i, output in enumerate(outputs):
+                    print(f"Output {req_id}({i}):{output}\n")
+        # TODO: Add pytorch precision
+    else:
+        generation_config = GenerationConfig(max_tokens=max_tokens, n=3)
+    output_texts, _ = engine.generate(prompts[:num_requests], generation_config)
     for req_id, outputs in enumerate(output_texts):
         print(f"Prompt {req_id}: {prompts[req_id]}")
         if len(outputs) == 1:
@@ -397,23 +421,29 @@ def test_engine_generate():
         else:
             for i, output in enumerate(outputs):
                 print(f"Output {req_id}({i}):{output}\n")
+    if compare_precision:
+        precision_flag = compare_output_text(output_texts, output_texts_single_model)
+        if precision_flag:
+            print(f"Accuracy verification succeed\n")
+        else:
+            print(f"Accuracy verification failed\n")
 
 
-def test_engine_eagle_generate():
+@require_test_model("Llama-2-7b-chat-hf-q0f16-MLC")
+def test_engine_eagle_generate(model: str):
     # Create engine
-    model = "dist/Llama-2-7b-chat-hf-q0f16-MLC"
-    model_lib_path = "dist/Llama-2-7b-chat-hf-q0f16-MLC/Llama-2-7b-chat-hf-q0f16-MLC-cuda.so"
     small_model = "dist/Eagle-llama2-7b-chat-q4f16_1-MLC"
-    small_model_lib_path = (
+    small_model_lib = (
         "dist/Eagle-llama2-7b-chat-q4f16_1-MLC/Eagle-llama2-7b-chat-q4f16_1-MLC-cuda.so"
     )
-    engine = SyncEngine(
+    engine = SyncMLCEngine(
         model=model,
-        model_lib_path=model_lib_path,
         mode="server",
-        max_total_sequence_length=4096,
-        additional_models=[small_model + ":" + small_model_lib_path],
-        engine_config=EngineConfig(speculative_mode=SpeculativeMode.EAGLE),
+        engine_config=EngineConfig(
+            max_total_sequence_length=4096,
+            additional_models=[(small_model, small_model_lib)],
+            speculative_mode="eagle",
+        ),
     )
 
     num_requests = 10
@@ -432,7 +462,8 @@ def test_engine_eagle_generate():
                 print(f"Output {req_id}({i}):{output}\n")
 
 
-def test_engine_efficiency():
+@require_test_model("Llama-2-13b-chat-hf-q4f16_1-MLC")
+def test_engine_efficiency(model: str):
     """Test engine speculative decoding efficiency."""
 
     # Hyperparameters for tests (you can try different combinations).
@@ -443,7 +474,7 @@ def test_engine_efficiency():
     np.random.seed(0)
 
     # Output list
-    outputs = [[] for _ in range(num_requests)]
+    outputs: List[List[int]] = [[] for _ in range(num_requests)]
 
     # Define the callback function for request generation results
     def fcallback(delta_outputs: List[RequestStreamOutput]):
@@ -453,13 +484,10 @@ def test_engine_efficiency():
             outputs[int(request_id)] += stream_outputs[0].delta_token_ids
 
     # Create engine
-    model = "dist/Llama-2-13b-chat-hf-q4f16_1-MLC"
-    model_lib_path = "dist/Llama-2-13b-chat-hf-q4f16_1-MLC/Llama-2-13b-chat-hf-q4f16_1-MLC-cuda.so"
-    engine = SyncEngine(
+    engine = SyncMLCEngine(
         model=model,
-        model_lib_path=model_lib_path,
         mode="server",
-        max_total_sequence_length=4096,
+        engine_config=EngineConfig(max_total_sequence_length=4096),
         request_stream_callback=fcallback,
     )
 
@@ -482,20 +510,19 @@ def test_engine_efficiency():
         engine.step()
 
     for eg, name in zip([engine], ["Normal Deconding"]):
-        stats = eg.stats()
+        metrics = eg.metrics()
         print("engine name:", name)
         if name == "Speculative Decoding":
-            print("total draft tokens:", stats["total_draft_tokens"])
-            print("total accepted tokens:", stats["total_accepted_tokens"])
-            print(
-                "Accept rate:",
-                stats["total_accepted_tokens"] / (1e-10 + stats["total_draft_tokens"]),
-            )
-        print("engine total decode time:", stats["engine_total_decode_time"])
+            print("spec decode metrics:", metrics["spec_decode"])
+        print("engine total decode time:", metrics["engine_decode_time_sum"])
         print()
 
 
-def test_engine_spec_efficiency():
+@require_test_model(
+    "Llama-2-13b-chat-hf-q4f16_1-MLC",
+    "Llama-2-7b-chat-hf-q4f16_1-MLC",
+)
+def test_engine_spec_efficiency(model: str, small_model: str):
     """Test engine speculative decoding efficiency."""
 
     # Hyperparameters for tests (you can try different combinations).
@@ -506,7 +533,7 @@ def test_engine_spec_efficiency():
     np.random.seed(0)
 
     # Output list
-    outputs = [[] for _ in range(num_requests)]
+    outputs: List[List[int]] = [[] for _ in range(num_requests)]
 
     # Define the callback function for request generation results
     def fcallback(delta_outputs: List[RequestStreamOutput]):
@@ -516,25 +543,14 @@ def test_engine_spec_efficiency():
             outputs[int(request_id)] += stream_outputs[0].delta_token_ids
 
     # Create engine
-    model = "dist/Llama-2-13b-chat-hf-q4f16_1-MLC"
-    model_lib_path = "dist/Llama-2-13b-chat-hf-q4f16_1-MLC/Llama-2-13b-chat-hf-q4f16_1-MLC-cuda.so"
-    small_model = "dist/Llama-2-7b-chat-hf-q4f16_1-MLC"
-    small_model_lib_path = (
-        "dist/Llama-2-7b-chat-hf-q4f16_1-MLC/Llama-2-7b-chat-hf-q4f16_1-MLC-cuda.so"
-    )
-    # If Flashinfer allows head_dim < 128, we can test this model
-    # small_model = "dist/TinyLlama-1.1B-Chat-v1.0-q0f16-MLC"
-    # small_model_lib_path = (
-    #     "dist/TinyLlama-1.1B-Chat-v1.0-q0f16-MLC/TinyLlama-1.1B-Chat-v1.0-q0f16-MLC-cuda.so"
-    # )
-    spec_engine = SyncEngine(
+    spec_engine = SyncMLCEngine(
         model=model,
-        model_lib_path=model_lib_path,
         mode="server",
-        max_total_sequence_length=4096,
-        additional_models=[small_model + ":" + small_model_lib_path],
         engine_config=EngineConfig(
-            spec_draft_length=6, speculative_mode=SpeculativeMode.SMALL_DRAFT
+            max_total_sequence_length=4096,
+            additional_models=[small_model],
+            spec_draft_length=6,
+            speculative_mode="small_draft",
         ),
         request_stream_callback=fcallback,
     )
@@ -558,20 +574,21 @@ def test_engine_spec_efficiency():
         spec_engine.step()
 
     for eg, name in zip([spec_engine], ["Speculative Decoding"]):
-        stats = eg.stats()
+        metrics = eg.metrics()
         print("engine name:", name)
         if name == "Speculative Decoding":
-            print("total draft tokens:", stats["total_draft_tokens"])
-            print("total accepted tokens:", stats["total_accepted_tokens"])
+            print("total draft tokens:", metrics["sum_num_draft_tokens"])
+            print("total accepted tokens:", metrics["sum_num_accepted_tokens"])
             print(
                 "Accept rate:",
-                stats["total_accepted_tokens"] / (1e-10 + stats["total_draft_tokens"]),
+                metrics["sum_num_accepted_tokens"] / (1e-10 + metrics["sum_num_draft_tokens"]),
             )
-        print("engine total decode time:", stats["engine_total_decode_time"])
+        print("engine total decode time:", metrics["engine_decode_time_sum"])
         print()
 
 
-def test_engine_eagle_spec_efficiency():
+@require_test_model("Llama-2-7b-chat-hf-q4f16_1-MLC")
+def test_engine_eagle_spec_efficiency(model: str):
     """Test engine speculative decoding efficiency."""
 
     # Hyperparameters for tests (you can try different combinations).
@@ -582,7 +599,7 @@ def test_engine_eagle_spec_efficiency():
     np.random.seed(0)
 
     # Output list
-    outputs = [[] for _ in range(num_requests)]
+    outputs: List[List[int]] = [[] for _ in range(num_requests)]
 
     # Define the callback function for request generation results
     def fcallback(delta_outputs: List[RequestStreamOutput]):
@@ -592,19 +609,17 @@ def test_engine_eagle_spec_efficiency():
             outputs[int(request_id)] += stream_outputs[0].delta_token_ids
 
     # Create engine
-    model = "dist/Llama-2-7b-chat-hf-q4f16_1-MLC"
-    model_lib_path = "dist/Llama-2-7b-chat-hf-q4f16_1-MLC/Llama-2-7b-chat-hf-q4f16_1-MLC-cuda.so"
     small_model = "dist/Eagle-llama2-7b-chat-q0f16-MLC"
-    small_model_lib_path = (
-        "dist/Eagle-llama2-7b-chat-q0f16-MLC/Eagle-llama2-7b-chat-q0f16-MLC-cuda.so"
-    )
-    spec_engine = SyncEngine(
+    small_model_lib = "dist/Eagle-llama2-7b-chat-q0f16-MLC/Eagle-llama2-7b-chat-q0f16-MLC-cuda.so"
+    spec_engine = SyncMLCEngine(
         model=model,
-        model_lib_path=model_lib_path,
         mode="server",
-        max_total_sequence_length=4096,
-        additional_models=[small_model + ":" + small_model_lib_path],
-        engine_config=EngineConfig(spec_draft_length=6, speculative_mode=SpeculativeMode.EAGLE),
+        engine_config=EngineConfig(
+            max_total_sequence_length=4096,
+            additional_models=[(small_model, small_model_lib)],
+            spec_draft_length=6,
+            speculative_mode="eagle",
+        ),
         request_stream_callback=fcallback,
     )
 
@@ -627,16 +642,11 @@ def test_engine_eagle_spec_efficiency():
         spec_engine.step()
 
     for eg, name in zip([spec_engine], ["Speculative Decoding"]):
-        stats = eg.stats()
+        metrics = eg.metrics()
         print("engine name:", name)
         if name == "Speculative Decoding":
-            print("total draft tokens:", stats["total_draft_tokens"])
-            print("total accepted tokens:", stats["total_accepted_tokens"])
-            print(
-                "Accept rate:",
-                stats["total_accepted_tokens"] / (1e-10 + stats["total_draft_tokens"]),
-            )
-        print("engine total decode time:", stats["engine_total_decode_time"])
+            print("spec decode:", metrics["spec_decode"])
+        print("engine total decode time:", metrics["engine_decode_time_sum"])
         print()
 
 
@@ -645,7 +655,7 @@ if __name__ == "__main__":
     test_engine_eagle_basic()
     test_engine_continuous_batching_1()
     test_engine_eagle_continuous_batching_1()
-    test_engine_generate()
+    test_engine_generate(compare_precision=True)
     test_engine_eagle_generate()
     test_engine_efficiency()
     test_engine_spec_efficiency()

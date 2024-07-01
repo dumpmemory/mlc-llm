@@ -1,9 +1,10 @@
 """The per-tensor quantization config"""
 
+import functools
 from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Type, Union
 
-from tvm import DataType, DataTypeCode, IRModule, te, tir, topi
+from tvm import DataType, DataTypeCode, IRModule, nd, te, tir, topi
 from tvm.relax.frontend import nn
 from tvm.runtime import NDArray
 
@@ -16,6 +17,7 @@ from .utils import (
     compile_quantize_func,
     convert_uint_packed_fp8_to_float,
     is_final_fc,
+    is_moe_gate,
     pack_weight,
 )
 
@@ -30,14 +32,21 @@ class PerTensorQuantize:  # pylint: disable=too-many-instance-attributes
     kind: str
     activation_dtype: Literal["e4m3_float8", "e5m2_float8"]
     weight_dtype: Literal["e4m3_float8", "e5m2_float8"]
-    storage_dtype: Literal["uint32"]
+    storage_dtype: Literal["uint32", "e4m3_float8", "e5m2_float8"]
     model_dtype: Literal["float16"]
     quantize_embedding: bool = True
     quantize_final_fc: bool = True
+    quantize_linear: bool = True
 
     num_elem_per_storage: int = 0
     max_int_value: int = 0
     use_scale: bool = True
+    # The calibration mode for quantization. If set to "inference", the model is built for
+    # inference. This should be used after calibration is done.
+    # If set to "max", the model is built for calibration that computes the scale using max value of
+    # the activations.
+    calibration_mode: Literal["inference", "max"] = "inference"
+    tensor_parallel_shards: int = 1
 
     def __post_init__(self):
         assert self.kind == "per-tensor-quant"
@@ -48,7 +57,11 @@ class PerTensorQuantize:  # pylint: disable=too-many-instance-attributes
         self._quantize_func_cache = {}
 
     def quantize_model(
-        self, model: nn.Module, quant_map: QuantizeMapping, name_prefix: str
+        self,
+        model: nn.Module,
+        quant_map: QuantizeMapping,
+        name_prefix: str,
+        tensor_parallel_shards: int,
     ) -> nn.Module:
         """
         Quantize model with per-tensor quantization
@@ -64,11 +77,16 @@ class PerTensorQuantize:  # pylint: disable=too-many-instance-attributes
         name_prefix : str
             The name prefix for visited weight.
 
+        tensor_parallel_shards : int
+            The number of tensor parallel shards.
+
         Returns
         -------
         ret : nn.Module
             The quantized nn.Module.
         """
+
+        self.tensor_parallel_shards = tensor_parallel_shards
 
         class _Mutator(nn.Mutator):
             def __init__(self, config: PerTensorQuantize, quant_map: QuantizeMapping) -> None:
@@ -101,21 +119,44 @@ class PerTensorQuantize:  # pylint: disable=too-many-instance-attributes
                         f"{name}.q_weight",
                     ]
                 )
-                if isinstance(node, nn.Linear) and (
-                    not is_final_fc(name) or self.config.quantize_final_fc
+                if (
+                    isinstance(node, nn.Linear)
+                    and self.config.quantize_linear
+                    and (not is_final_fc(name) or self.config.quantize_final_fc)
+                    and not is_moe_gate(name, node)
                 ):
                     self.quant_map.param_map[weight_name] = param_names
                     self.quant_map.map_func[weight_name] = self.config.quantize_weight
-                    return PerTensorQuantizeLinear.from_linear(node, self.config)
-                if isinstance(node, nn.Embedding) and self.config.quantize_embedding:
+                    op = PerTensorQuantizeLinear.from_linear(node, self.config, name)
+                elif isinstance(node, nn.Embedding) and self.config.quantize_embedding:
                     self.quant_map.param_map[weight_name] = param_names
                     self.quant_map.map_func[weight_name] = self.config.quantize_weight
-                    return PerTensorQuantizeEmbedding.from_embedding(node, self.config)
-                if isinstance(node, MixtralExperts):
+                    op = PerTensorQuantizeEmbedding.from_embedding(node, self.config)
+                elif isinstance(node, MixtralExperts):
                     self.quant_map.param_map[weight_name] = param_names
                     self.quant_map.map_func[weight_name] = self.config.quantize_weight
-                    return PerTensorQuantizeMixtralExperts.from_mixtral_experts(node, self.config)
-                return self.visit(name, node)
+                    op = PerTensorQuantizeMixtralExperts.from_mixtral_experts(
+                        node, self.config, name
+                    )
+                else:
+                    return self.visit(name, node)
+
+                if hasattr(op, "q_calibration_scale") and op.q_calibration_scale:
+                    # update quant_map for calibration scale
+                    param_name = f"{name}.q_calibration_scale"
+                    old_map_func = self.quant_map.map_func[weight_name]
+
+                    def map_func(*args, **kwargs):
+                        # placeholder for calibration scale, the actual value will be set after
+                        # calibration.
+                        scale = nd.empty(
+                            shape=op.q_calibration_scale.shape, dtype=op.q_calibration_scale.dtype
+                        )
+                        return [*old_map_func(*args, **kwargs), scale]
+
+                    self.quant_map.param_map[weight_name].append(param_name)
+                    self.quant_map.map_func[weight_name] = map_func
+                return op
 
         model.to(dtype=self.model_dtype)
         mutator = _Mutator(self, quant_map)
@@ -144,7 +185,11 @@ class PerTensorQuantize:  # pylint: disable=too-many-instance-attributes
                 DataTypeCode.E4M3Float,
                 DataTypeCode.E5M2Float,
             ]:
-                quantize_func = self._quantize_float8
+                quantize_func = functools.partial(
+                    self.quantize_float8,
+                    quantize_dtype=self.weight_dtype,
+                    storage_dtype=self.storage_dtype,
+                )
             else:
                 assert NotImplementedError()
 
@@ -168,13 +213,13 @@ class PerTensorQuantize:  # pylint: disable=too-many-instance-attributes
             self._quantize_func_cache[key] = quantize_func
         return quantize_func(weight)
 
-    def _quantize_float8(  # pylint: disable=too-many-locals
+    def quantize_float8(  # pylint: disable=too-many-locals
         self,
-        weight: nn.Tensor,
+        tensor: nn.Tensor,
+        quantize_dtype: str,
+        storage_dtype: str,
     ) -> Union[Tuple[nn.Tensor], Tuple[nn.Tensor, nn.Tensor]]:
         """Per-tensor quantization for weight tensor, defined in tensor expression."""
-
-        quantize_dtype = DataType(self.weight_dtype)
 
         if self.use_scale:
             # min_scaling_factor taken from TRT-LLM
@@ -183,17 +228,21 @@ class PerTensorQuantize:  # pylint: disable=too-many-instance-attributes
                 min_scaling_factor = tir.const(1.0 / (self.max_int_value * 512.0), self.model_dtype)
                 scale = topi.maximum(
                     max_abs.astype(self.model_dtype) / self.max_int_value, min_scaling_factor
-                )
+                ).astype("float32")
                 scale = topi.expand_dims(scale, axis=0)
                 return scale
 
-            scale = nn.tensor_expr_op(_compute_scale, "compute_scale", args=[weight])
+            scale = nn.tensor_expr_op(_compute_scale, "compute_scale", args=[tensor])
         else:
             scale = None
 
-        def _compute_quantized_weight(weight: te.Tensor, scale: Optional[te.Tensor]) -> te.Tensor:
-            elem_storage_dtype = f"uint{quantize_dtype.bits}"
-            scaled_weight = te.compute(
+        def _compute_quantized_tensor(weight: te.Tensor, scale: Optional[te.Tensor]) -> te.Tensor:
+            elem_storage_dtype = (
+                f"uint{DataType(quantize_dtype).bits}"
+                if DataType(storage_dtype).type_code == DataTypeCode.UINT
+                else quantize_dtype
+            )
+            scaled_tensor = te.compute(
                 shape=weight.shape,
                 fcompute=lambda *idx: tir.Cast(
                     self.storage_dtype,
@@ -207,8 +256,11 @@ class PerTensorQuantize:  # pylint: disable=too-many-instance-attributes
                 ),
             )
 
+            if quantize_dtype == self.storage_dtype:
+                return scaled_tensor
+
             packed_weight = pack_weight(
-                scaled_weight,
+                scaled_tensor,
                 axis=-1,
                 num_elem_per_storage=self.num_elem_per_storage,
                 weight_dtype=self.weight_dtype,
@@ -217,13 +269,13 @@ class PerTensorQuantize:  # pylint: disable=too-many-instance-attributes
 
             return packed_weight
 
-        quantized_weight = nn.tensor_expr_op(
-            _compute_quantized_weight, "compute_quantized_weight", args=[weight, scale]
+        quantized_tensor = nn.tensor_expr_op(
+            _compute_quantized_tensor, "compute_quantized_tensor", args=[tensor, scale]
         )
 
         if self.use_scale:
-            return quantized_weight, scale
-        return (quantized_weight,)
+            return quantized_tensor, scale
+        return (quantized_tensor,)
 
     def _dequantize(
         self,
@@ -242,24 +294,27 @@ class PerTensorQuantize:  # pylint: disable=too-many-instance-attributes
 
     def dequantize_float8(
         self,
-        q_weight: te.Tensor,
+        q_tensor: te.Tensor,
         scale: Optional[te.Tensor],
         quantize_dtype: str,
         out_shape: Optional[Sequence[tir.PrimExpr]] = None,
     ) -> te.Tensor:
-        """Dequantize a fp8 tensor to higher-precision float."""
-        weight = convert_uint_packed_fp8_to_float(
-            q_weight,
-            self.num_elem_per_storage,
-            self.storage_dtype,
-            self.model_dtype,
-            quantize_dtype,
-            axis=-1,
-            out_shape=out_shape,
-        )
+        """Dequantize a fp8 tensor (input or weight) to higher-precision float."""
+        if quantize_dtype != self.storage_dtype:
+            dequantized_tensor = convert_uint_packed_fp8_to_float(
+                q_tensor,
+                self.num_elem_per_storage,
+                self.storage_dtype,
+                self.model_dtype,
+                quantize_dtype,
+                axis=-1,
+                out_shape=out_shape,
+            )
+        else:
+            dequantized_tensor = q_tensor.astype(self.model_dtype)
         if scale is not None:
-            weight = weight * scale
-        return weight
+            dequantized_tensor = dequantized_tensor * scale.astype(dequantized_tensor.dtype)
+        return dequantized_tensor
 
 
 class PerTensorQuantizeLinear(nn.Module):  # pylint: disable=too-many-instance-attributes
@@ -270,20 +325,25 @@ class PerTensorQuantizeLinear(nn.Module):  # pylint: disable=too-many-instance-a
         in_features: int,
         out_features: Union[int, tir.Var],
         config: PerTensorQuantize,
+        name: str,
         bias: bool = True,
         out_dtype: Optional[str] = None,
     ) -> None:
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.out_dtype = out_dtype
+        self.out_dtype = out_dtype or config.model_dtype
         self.config = config
+        self.name = name
         self.q_weight = nn.Parameter(
             (out_features, tir.ceildiv(in_features, config.num_elem_per_storage)),
             config.storage_dtype,
         )
+        self.q_calibration_scale = None
         if config.use_scale:
-            self.q_scale = nn.Parameter((1,), config.model_dtype)
+            self.q_scale = nn.Parameter((1,), "float32")
+            if config.calibration_mode == "inference":
+                self.q_calibration_scale = nn.Parameter((1,), "float32")
         else:
             self.q_scale = None
         if bias:
@@ -294,7 +354,9 @@ class PerTensorQuantizeLinear(nn.Module):  # pylint: disable=too-many-instance-a
             self.bias = None
 
     @classmethod
-    def from_linear(cls, src: nn.Linear, config: PerTensorQuantize) -> "PerTensorQuantizeLinear":
+    def from_linear(
+        cls, src: nn.Linear, config: PerTensorQuantize, name: str
+    ) -> "PerTensorQuantizeLinear":
         """
         Converts a non-quantized nn.Linear to a per-tensor quantized PerTensorQuantizeLinear
 
@@ -306,6 +368,9 @@ class PerTensorQuantizeLinear(nn.Module):  # pylint: disable=too-many-instance-a
         config : PerTensorQuantize
             The per-tensor quantization config.
 
+        name: str
+            The name of the layer.
+
         Returns
         -------
         ret : PerTensorQuantizeLinear
@@ -316,6 +381,7 @@ class PerTensorQuantizeLinear(nn.Module):  # pylint: disable=too-many-instance-a
             in_features=in_features,
             out_features=out_features,
             config=config,
+            name=name,
             bias=getattr(src, "bias", None) is not None,
             out_dtype=src.out_dtype,
         )
@@ -341,24 +407,57 @@ class PerTensorQuantizeLinear(nn.Module):  # pylint: disable=too-many-instance-a
         ret : nn.Tensor
             The output tensor for the per-tensor quantized linear layer.
         """
-        w = nn.op.tensor_expr_op(
-            lambda weight, scale: self.config._dequantize(  # pylint: disable=protected-access
-                weight,
-                scale,
-                out_shape=[
-                    (
-                        tir.IntImm("int64", self.out_features)
-                        if isinstance(self.out_features, int)
-                        else weight.shape[0]
-                    ),
-                    tir.IntImm("int64", self.in_features),
-                ],
-            ),
-            "dequantize",
-            args=[self.q_weight, self.q_scale],
-        )
-        w = nn.op.permute_dims(w)
-        x = nn.op.matmul(x, w, out_dtype=self.out_dtype)
+        # Note: Use calibration scale when calibration is enabled
+        if self.config.calibration_mode == "inference":
+            if self.q_calibration_scale:
+                x /= self.q_calibration_scale.astype(x.dtype)
+            x_q = x.astype(self.config.activation_dtype)
+            x_scale = self.q_calibration_scale
+        elif self.config.calibration_mode == "max":
+            _, x_scale = self.config.quantize_float8(  # type: ignore
+                x,
+                quantize_dtype=self.config.activation_dtype,
+                storage_dtype=self.config.storage_dtype,
+            )
+            if self.config.tensor_parallel_shards > 1:
+                x_scale = nn.ccl_allreduce(x_scale, "max")
+            x_scale = nn.extern(
+                "mlc_llm.calibration_observer",
+                [f"{self.name}.q_calibration_scale", "max", x_scale],
+                out=nn.Tensor.placeholder(x_scale.shape, x_scale.dtype),
+            )
+            x_q = (x / x_scale.astype(x.dtype)).astype(self.config.activation_dtype)
+            x = x_q.astype(self.config.model_dtype) * x_scale.astype(self.config.model_dtype)
+        else:
+            raise ValueError(f"Unknown calibration mode: {self.config.calibration_mode}")
+
+        if (
+            self.config.weight_dtype == self.config.storage_dtype
+            and self.config.calibration_mode == "inference"
+        ):
+            x = nn.op.matmul(x_q, nn.permute_dims(self.q_weight), out_dtype="float32")
+            if self.config.use_scale:
+                scale = x_scale * self.q_scale
+                x = x * scale
+            x = x.astype(self.out_dtype)
+        else:
+            w = nn.op.tensor_expr_op(
+                lambda weight, scale: self.config._dequantize(  # pylint: disable=protected-access
+                    weight,
+                    scale,
+                    out_shape=[
+                        (
+                            tir.IntImm("int64", self.out_features)
+                            if isinstance(self.out_features, int)
+                            else weight.shape[0]
+                        ),
+                        tir.IntImm("int64", self.in_features),
+                    ],
+                ),
+                "dequantize",
+                args=[self.q_weight, self.q_scale],
+            )
+            x = nn.op.matmul(x, nn.permute_dims(w), out_dtype=self.out_dtype)
         if self.bias is not None:
             x = x + self.bias
         return x
@@ -388,7 +487,7 @@ class PerTensorQuantizeEmbedding(nn.Module):
             (num, tir.ceildiv(dim, config.num_elem_per_storage)), config.storage_dtype
         )
         if self.config.use_scale:
-            self.q_scale = nn.Parameter((1,), config.model_dtype)
+            self.q_scale = nn.Parameter((1,), "float32")
         else:
             self.q_scale = None
 
@@ -489,11 +588,13 @@ class PerTensorQuantizeMixtralExperts(nn.Module):  # pylint: disable=too-many-in
         in_features,
         out_features,
         config: PerTensorQuantize,
+        name: str,
     ):  # pylint: disable=too-many-arguments
         self.num_local_experts = num_local_experts
         self.in_features = in_features
         self.out_features = out_features
         self.config = config
+        self.name = name
         self.q_weight = nn.Parameter(
             (
                 num_local_experts,
@@ -502,8 +603,11 @@ class PerTensorQuantizeMixtralExperts(nn.Module):  # pylint: disable=too-many-in
             ),
             config.storage_dtype,
         )
+        self.q_calibration_scale = None
         if config.use_scale:
-            self.q_scale = nn.Parameter((1,), config.model_dtype)
+            self.q_scale = nn.Parameter((1,), "float32")
+            if config.calibration_mode == "inference":
+                self.q_calibration_scale = nn.Parameter((1,), "float32")
         else:
             self.q_scale = None
 
@@ -511,6 +615,7 @@ class PerTensorQuantizeMixtralExperts(nn.Module):  # pylint: disable=too-many-in
     def from_mixtral_experts(
         src: "MixtralExperts",
         config: PerTensorQuantize,
+        name: str,
     ) -> "PerTensorQuantizeMixtralExperts":
         """
         Converts a non-quantized MixtralExperts to a per-tensor quantized
@@ -524,6 +629,9 @@ class PerTensorQuantizeMixtralExperts(nn.Module):  # pylint: disable=too-many-in
         config : PerTensorQuantize
             The per-tensor quantization config
 
+        name: str
+            The name of the layer.
+
         Returns
         -------
         ret : PerTensorQuantizeMixtralExperts
@@ -533,7 +641,9 @@ class PerTensorQuantizeMixtralExperts(nn.Module):  # pylint: disable=too-many-in
             DataTypeCode.E4M3Float,
             DataTypeCode.E5M2Float,
         ]:
-            return PerTensorQuantizeMixtralExperts._IMPL["fp8"].from_mixtral_experts(src, config)
+            return PerTensorQuantizeMixtralExperts._IMPL["fp8"].from_mixtral_experts(
+                src, config, name
+            )
         raise NotImplementedError()
 
     def forward(self, x: nn.Tensor, indptr: nn.Tensor) -> nn.Tensor:  # pylint: disable=invalid-name

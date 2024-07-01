@@ -4,37 +4,9 @@
  */
 #include "engine_state.h"
 
-#include <picojson.h>
-
 namespace mlc {
 namespace llm {
 namespace serve {
-
-String EngineStats::AsJSON() const {
-  picojson::object config;
-  config["single_token_prefill_latency"] =
-      picojson::value(request_total_prefill_time / total_prefill_length);
-  config["single_token_decode_latency"] =
-      picojson::value(request_total_decode_time / total_decode_length);
-  config["engine_total_prefill_time"] = picojson::value(engine_total_prefill_time);
-  config["engine_total_decode_time"] = picojson::value(engine_total_decode_time);
-  config["total_prefill_tokens"] = picojson::value(total_prefill_length);
-  config["total_decode_tokens"] = picojson::value(total_decode_length);
-  config["total_accepted_tokens"] = picojson::value(total_accepted_length);
-  config["total_draft_tokens"] = picojson::value(total_draft_length);
-  return picojson::value(config).serialize(true);
-}
-
-void EngineStats::Reset() {
-  request_total_prefill_time = 0.0f;
-  request_total_decode_time = 0.0f;
-  engine_total_prefill_time = 0.0f;
-  engine_total_decode_time = 0.0f;
-  total_prefill_length = 0;
-  total_decode_length = 0;
-  total_accepted_length = 0;
-  total_draft_length = 0;
-}
 
 TVM_REGISTER_OBJECT_TYPE(EngineStateObj);
 
@@ -45,7 +17,10 @@ void EngineStateObj::Reset() {
   waiting_queue.clear();
   request_states.clear();
   id_manager.Reset();
-  stats.Reset();
+  metrics.Reset();
+  if (prefix_cache.defined()) {
+    prefix_cache->Reset();
+  }
 }
 
 RequestState EngineStateObj::GetRequestState(Request request) {

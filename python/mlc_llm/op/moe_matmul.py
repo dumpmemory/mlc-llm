@@ -2,7 +2,7 @@
 
 from typing import Literal, Optional
 
-from tvm import DataType, tir
+from tvm import DataType, DataTypeCode, tir
 from tvm.relax.frontend.nn import Tensor, op
 from tvm.script import tir as T
 
@@ -218,6 +218,7 @@ def dequantize_float8_gemv(
         if num_elem_per_storage == 1:
             w = tir.reinterpret(quantize_dtype, w[e, i, j])
         else:
+            assert DataType(storage_dtype).type_code == DataTypeCode.UINT
             tir_bin_mask = tir.const((2**quantize_dtype_bits) - 1, storage_dtype)
             w = w[e, i, j // num_elem_per_storage]
             shift = (j % num_elem_per_storage * quantize_dtype_bits).astype(storage_dtype)
@@ -237,7 +238,7 @@ def dequantize_float8_gemv(
     def _func_with_scale(
         x: T.Buffer((x_leading_dim, in_features), model_dtype),
         w: T.Buffer((local_experts, out_features, num_storage), storage_dtype),
-        scale: T.Buffer((1,), model_dtype),
+        scale: T.Buffer((1,), "float32"),
         indptr: T.Buffer((1, experts_per_tok), "int32"),
         o: T.Buffer((experts_per_tok, out_features), model_dtype),
     ):

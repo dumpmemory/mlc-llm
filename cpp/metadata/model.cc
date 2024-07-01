@@ -4,7 +4,7 @@
 
 #include <unordered_map>
 
-#include "./json_parser.h"
+#include "../support/json_parser.h"
 
 namespace mlc {
 namespace llm {
@@ -39,6 +39,16 @@ ModelMetadata::Param ModelMetadata::Param::FromJSON(const picojson::object& para
   return result;
 }
 
+ModelMetadata::KVCacheMetadata ModelMetadata::KVCacheMetadata::FromJSON(
+    const picojson::object& json) {
+  KVCacheMetadata kv_cache_metadata;
+  kv_cache_metadata.num_hidden_layers = json::Lookup<int64_t>(json, "num_hidden_layers");
+  kv_cache_metadata.head_dim = json::Lookup<int64_t>(json, "head_dim");
+  kv_cache_metadata.num_attention_heads = json::Lookup<int64_t>(json, "num_attention_heads");
+  kv_cache_metadata.num_key_value_heads = json::Lookup<int64_t>(json, "num_key_value_heads");
+  return kv_cache_metadata;
+}
+
 ModelMetadata ModelMetadata::FromJSON(const picojson::object& metadata,
                                       const picojson::object& model_config) {
   ModelMetadata result;
@@ -46,6 +56,7 @@ ModelMetadata ModelMetadata::FromJSON(const picojson::object& metadata,
   result.quantization = json::Lookup<std::string>(metadata, "quantization");
   result.context_window_size = json::Lookup<int64_t>(metadata, "context_window_size");
   result.prefill_chunk_size = json::Lookup<int64_t>(metadata, "prefill_chunk_size");
+  result.max_batch_size = json::Lookup<int64_t>(metadata, "max_batch_size");
   if (metadata.count("sliding_window_size"))
     result.sliding_window_size = json::Lookup<int64_t>(metadata, "sliding_window_size");
   if (metadata.count("sliding_window"))  // to be removed after SLM migration
@@ -53,6 +64,17 @@ ModelMetadata ModelMetadata::FromJSON(const picojson::object& metadata,
   if (metadata.count("attention_sink_size"))  // remove after sink is decoupled from model lib
     result.attention_sink_size = json::Lookup<int64_t>(metadata, "attention_sink_size");
   result.tensor_parallel_shards = json::Lookup<int64_t>(metadata, "tensor_parallel_shards");
+  result.kv_state_kind = KVStateKindFromString(
+      json::LookupOrDefault<std::string>(metadata, "kv_state_kind", "kv_cache"));
+  if (result.kv_state_kind != KVStateKind::kNone) {
+    result.kv_cache_metadata =
+        KVCacheMetadata::FromJSON(json::Lookup<picojson::object>(metadata, "kv_cache"));
+  } else {
+    result.kv_cache_metadata = {/*num_hidden_layers=*/0,
+                                /*head_dim=*/0,
+                                /*num_attention_heads=*/0,
+                                /*num_key_value_heads=*/0};
+  }
   {
     std::vector<ModelMetadata::Param>& params = result.params;
     picojson::array json_params = json::Lookup<picojson::array>(metadata, "params");
@@ -76,22 +98,13 @@ ModelMetadata ModelMetadata::FromJSON(const picojson::object& metadata,
 ModelMetadata ModelMetadata::FromModule(tvm::runtime::Module module,
                                         const picojson::object& model_config) {
   std::string json_str = "";
-  try {
-    TypedPackedFunc<String()> pf = module.GetFunction("_metadata");
-    if (pf == nullptr) {
-      // legacy path
-      // TODO: remove this after full SLMify
-      return ModelMetadata();
-    }
-    json_str = pf();
-  } catch (...) {
-    return ModelMetadata();  // TODO: add a warning message about legacy usecases
-  }
-  picojson::object json = json::ParseToJsonObject(json_str);
+  TypedPackedFunc<String()> pf = module.GetFunction("_metadata");
+  json_str = pf();
+  picojson::object json = json::ParseToJSONObject(json_str);
   try {
     return ModelMetadata::FromJSON(json, model_config);
   } catch (const std::exception& e) {
-    LOG(WARNING) << "Failed to parse metadata:\n" << json_str;
+    LOG(WARNING) << "Failed to parse metadata:\n" << json_str << "\nerror: " << e.what();
     throw e;
   }
 }

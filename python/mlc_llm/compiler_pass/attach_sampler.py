@@ -7,6 +7,9 @@ from tvm import IRModule, relax, te, tir
 from tvm.relax.frontend import nn
 from tvm.script import tir as T
 
+from mlc_llm.op.batch_spec_verify import batch_spec_verify
+from mlc_llm.op.top_p_pivot import top_p_pivot, top_p_renorm
+
 
 @tvm.transform.module_pass(opt_level=0, name="AttachGPUSamplingFunc")
 class AttachGPUSamplingFunc:  # pylint: disable=too-few-public-methods
@@ -25,27 +28,20 @@ class AttachGPUSamplingFunc:  # pylint: disable=too-few-public-methods
 
     def transform_module(self, mod: IRModule, _ctx: tvm.transform.PassContext) -> IRModule:
         """Entrypoint"""
-        if str(self.target.kind) != "cuda":
+        if str(self.target.kind) not in ["cuda", "vulkan"]:
             # Only enable GPU sampling for CUDA.
             return mod
 
         bb = relax.BlockBuilder(mod)
-        # Prefill method exists in base models.
-        # Prefill_to_last_hidden method exists in base model and speculative small models
-        if "prefill" in mod:
-            vocab_size = mod["prefill"].ret_struct_info.fields[0].shape[-1]
-        else:
-            assert (
-                "prefill_to_last_hidden_states" in mod
-            ), "Everay model should either has 'prefill' or 'prefill_to_last_hidden_states' method"
-            vocab_size = mod["prefill_to_last_hidden_states"].ret_struct_info.fields[0].shape[-1]
         gv_names = [
             gv.name_hint
             for gv in [
-                _attach_multinomial_sampling_func(bb, vocab_size),
-                _attach_argsort_func(bb, vocab_size),
-                _attach_sample_with_top_p(bb, vocab_size),
-                _attach_take_probs_func(bb, vocab_size),
+                _attach_multinomial_sampling_func(bb),
+                _attach_argsort_func(bb),
+                _attach_sample_with_top_p(bb),
+                _attach_take_probs_func(bb),
+                _attach_batch_verifier(bb),
+                _attach_renormalize_by_top_p(bb, self.target),
             ]
         ]
 
@@ -59,9 +55,10 @@ class AttachGPUSamplingFunc:  # pylint: disable=too-few-public-methods
         return mod
 
 
-def _attach_multinomial_sampling_func(bb: relax.BlockBuilder, vocab_size: tir.PrimExpr):
+def _attach_multinomial_sampling_func(bb: relax.BlockBuilder):
     batch_size = tir.Var("batch_size", "int64")
     num_samples = tir.Var("num_samples", "int64")
+    vocab_size = tir.Var("vocab_size", "int64")
     probs = relax.Var("probs", relax.TensorStructInfo((batch_size, vocab_size), "float32"))
     uniform_samples = relax.Var(
         "uniform_samples", relax.TensorStructInfo((num_samples,), "float32")
@@ -90,7 +87,11 @@ def _attach_multinomial_sampling_func(bb: relax.BlockBuilder, vocab_size: tir.Pr
                 name="sample_indices",
             )
             result_tensor = nn.multinomial_from_uniform(  # pylint:disable=too-many-function-args
-                probs_tensor, uniform_samples_tensor, sample_indices_tensor, "int32"
+                probs_tensor,
+                uniform_samples_tensor,
+                sample_indices_tensor,
+                "int32",
+                name="nn_multinomial_from_uniform",
             )
             result = bb.emit(
                 relax.call_pure_packed(
@@ -100,12 +101,14 @@ def _attach_multinomial_sampling_func(bb: relax.BlockBuilder, vocab_size: tir.Pr
                     sinfo_args=sample_indices.struct_info,  # pylint: disable=no-member
                 )
             )
-        gv = bb.emit_func_output(result)
+            output = bb.emit_output(result)
+        gv = bb.emit_func_output(output)
     return gv
 
 
-def _attach_argsort_func(bb: relax.BlockBuilder, vocab_size: tir.PrimExpr):
+def _attach_argsort_func(bb: relax.BlockBuilder):
     batch_size = tir.Var("batch_size", "int64")
+    vocab_size = tir.Var("vocab_size", "int64")
     probs = relax.Var("probs", relax.TensorStructInfo((batch_size, vocab_size), "float32"))
     with bb.function("argsort_probs", [probs]):
         with bb.dataflow():
@@ -120,17 +123,26 @@ def _attach_argsort_func(bb: relax.BlockBuilder, vocab_size: tir.PrimExpr):
                 sorted_indices,
                 primfunc_name_hint="take_sorted_probs",
             )
-            output = (sorted_values, sorted_indices)
-            bb.emit_output(output)
+            output = bb.emit_output((sorted_values, sorted_indices))
         gv = bb.emit_func_output(output)
     return gv
 
 
-def _attach_sample_with_top_p(  # pylint: disable=too-many-locals
-    bb: relax.BlockBuilder, vocab_size: tir.PrimExpr
-):
+@T.prim_func
+def full(var_result: T.handle, value: T.int32):
+    """The filling function for top k."""
+    batch_size = T.int32(is_size_var=True)
+    result = T.match_buffer(var_result, (batch_size, 1), "int32")
+    for i in T.serial(batch_size):
+        with T.block("block"):
+            vi = T.axis.spatial(batch_size, i)
+            result[vi, 0] = value
+
+
+def _attach_sample_with_top_p(bb: relax.BlockBuilder):  # pylint: disable=too-many-locals
     batch_size = tir.Var("batch_size", "int64")
     num_samples = tir.Var("num_samples", "int64")
+    vocab_size = tir.Var("vocab_size", "int64")
     sorted_probs = relax.Var(
         "sorted_probs", relax.TensorStructInfo((batch_size, vocab_size), "float32")
     )
@@ -142,15 +154,6 @@ def _attach_sample_with_top_p(  # pylint: disable=too-many-locals
     )
     sample_indices = relax.Var("sample_indices", relax.TensorStructInfo((num_samples,), "int32"))
     top_p = relax.Var("top_p", relax.TensorStructInfo((batch_size,), "float32"))
-
-    @T.prim_func
-    def full(var_result: T.handle, value: T.int32):
-        batch_size = T.int32(is_size_var=True)
-        result = T.match_buffer(var_result, (batch_size, 1), "int32")
-        for i in T.serial(batch_size):
-            with T.block("block"):
-                vi = T.axis.spatial(batch_size, i)
-                result[vi, 0] = value
 
     with bb.function(
         "sample_with_top_p",
@@ -208,7 +211,7 @@ def _attach_sample_with_top_p(  # pylint: disable=too-many-locals
                     sample_indices_tensor,
                 )
             )
-            result = bb.emit(
+            result = bb.emit_output(
                 relax.call_pure_packed(
                     "vm.builtin.reshape",
                     result_tensor._expr,  # pylint: disable=protected-access
@@ -216,15 +219,46 @@ def _attach_sample_with_top_p(  # pylint: disable=too-many-locals
                     sinfo_args=sample_indices.struct_info,  # pylint: disable=no-member
                 )
             )
-            bb.emit_output(result)
         gv = bb.emit_func_output(result)
     return gv
 
 
-def _attach_take_probs_func(bb: relax.BlockBuilder, vocab_size: tir.PrimExpr):
+def _attach_renormalize_by_top_p(bb: relax.BlockBuilder, target: tvm.target.Target):
+    batch_size = tir.Var("batch_size", "int64")
+    vocab_size = tir.Var("vocab_size", "int64")
+    num_pivots = 3
+    probs = relax.Var("probs", relax.TensorStructInfo((batch_size, vocab_size), "float32"))
+    top_p = relax.Var("top_p", relax.TensorStructInfo((batch_size,), "float32"))
+    init_pivots = relax.Var(
+        "init_pivots", relax.TensorStructInfo((batch_size, num_pivots), "float32")
+    )
+    with bb.function("renormalize_by_top_p", [probs, top_p, init_pivots]):
+        with bb.dataflow():
+            cutoff_output = bb.emit(
+                relax.call_tir(
+                    bb.add_func(top_p_pivot(num_pivots, target), "top_p_pivot_cutoff"),
+                    args=[probs, top_p, init_pivots],
+                    out_sinfo=[top_p.struct_info, top_p.struct_info],  # pylint: disable=no-member
+                )
+            )
+            final_pivot = cutoff_output[0]
+            renorm_sum = cutoff_output[1]
+            renormalized_probs = bb.emit_output(
+                relax.call_tir(
+                    bb.add_func(top_p_renorm(target), "top_p_renorm_after_cutoff"),
+                    args=[probs, final_pivot, renorm_sum],
+                    out_sinfo=probs.struct_info,  # pylint: disable=no-member
+                )
+            )
+        gv = bb.emit_func_output(renormalized_probs)
+    return gv
+
+
+def _attach_take_probs_func(bb: relax.BlockBuilder):
     batch_size = tir.Var("batch_size", "int64")
     num_samples = tir.Var("num_samples", "int64")
     num_positions = tir.Var("num_positions", "int64")
+    vocab_size = tir.Var("vocab_size", "int64")
     unsorted_probs = relax.Var(
         "unsorted_probs", relax.TensorStructInfo((batch_size, vocab_size), "float32")
     )
@@ -275,7 +309,7 @@ def _attach_take_probs_func(bb: relax.BlockBuilder, vocab_size: tir.PrimExpr):
     args = [unsorted_probs, sorted_indices, sample_indices, sampling_results, top_prob_offsets]
     with bb.function("sampler_take_probs", args):
         with bb.dataflow():
-            taken_probs_indices = bb.emit(
+            taken_probs_indices = bb.emit_output(
                 relax.call_tir(
                     bb.add_func(sampler_take_probs_tir, "sampler_take_probs_tir"),
                     args,
@@ -286,6 +320,52 @@ def _attach_take_probs_func(bb: relax.BlockBuilder, vocab_size: tir.PrimExpr):
                     ],
                 )
             )
-            bb.emit_output(taken_probs_indices)
         gv = bb.emit_func_output(taken_probs_indices)
+    return gv
+
+
+def _attach_batch_verifier(bb: relax.BlockBuilder):
+    num_nodes = tir.Var("num_nodes", "int64")
+    nbatch = tir.Var("nbatch", "int64")
+    vocab_size = tir.Var("vocab_size", "int64")
+    draft_probs = relax.Var(
+        "draft_probs", relax.TensorStructInfo((num_nodes, vocab_size), "float32")
+    )
+    draft_tokens = relax.Var("draft_tokens", relax.TensorStructInfo((num_nodes,), "int32"))
+    model_probs = relax.Var(
+        "model_probs", relax.TensorStructInfo((num_nodes, vocab_size), "float32")
+    )
+    token_tree_first_child = relax.Var(
+        "token_tree_first_child", relax.TensorStructInfo((num_nodes,), "int32")
+    )
+    token_tree_next_sibling = relax.Var(
+        "token_tree_next_sibling", relax.TensorStructInfo((num_nodes,), "int32")
+    )
+    uniform_samples = relax.Var("uniform_samples", relax.TensorStructInfo((num_nodes,), "float32"))
+    token_tree_parent_ptr = relax.Var(
+        "token_tree_parent_ptr", relax.TensorStructInfo((nbatch,), "int32")
+    )
+    args = [
+        draft_probs,
+        draft_tokens,
+        model_probs,
+        token_tree_first_child,
+        token_tree_next_sibling,
+        uniform_samples,
+        token_tree_parent_ptr,
+    ]
+    with bb.function("sampler_verify_draft_tokens", args):
+        with bb.dataflow():
+            res = bb.emit_output(
+                relax.call_tir_inplace(
+                    bb.add_func(batch_spec_verify(vocab_size), "batch_verify_on_gpu_single_kernel"),
+                    args,
+                    inplace_indices=[args.index(model_probs), args.index(token_tree_parent_ptr)],
+                    out_sinfo=[
+                        model_probs.struct_info,  # pylint: disable=no-member
+                        token_tree_parent_ptr.struct_info,  # pylint: disable=no-member
+                    ],
+                )
+            )
+        gv = bb.emit_func_output(res)
     return gv

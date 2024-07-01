@@ -29,13 +29,19 @@
 
 // Pass in COMPILE_MLC_WASM_RUNTIME so unsupported code would not be compiled in to the .bc file
 #define COMPILE_MLC_WASM_RUNTIME 1
+#define __STDC_FORMAT_MACROS 1
+#define PICOJSON_USE_INT64
 
 #define DMLC_USE_LOGGING_LIBRARY <tvm/runtime/logging.h>
 
 // Grammar related
-#include "serve/grammar/grammar.cc"
-#include "serve/grammar/grammar_parser.cc"
-#include "serve/grammar/grammar_serializer.cc"
-#include "serve/grammar/grammar_simplifier.cc"
-#include "serve/grammar/grammar_state_matcher.cc"
+#include "grammar/grammar.cc"
+#include "grammar/grammar_functor.cc"
+#include "grammar/grammar_parser.cc"
+#include "grammar/grammar_serializer.cc"
+#include "grammar/grammar_state_matcher.cc"
+#include "grammar/json_schema_converter.cc"
 #include "support/encoding.cc"
+
+// Only compiles necessary functions for mlc.PostProcessTokenTable
+#include "tokenizers/tokenizers.cc"

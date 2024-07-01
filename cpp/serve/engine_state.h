@@ -5,8 +5,12 @@
 #ifndef MLC_LLM_SERVE_ENGINE_STATE_H_
 #define MLC_LLM_SERVE_ENGINE_STATE_H_
 
+#include <picojson.h>
 #include <tvm/runtime/container/string.h>
 
+#include "config.h"
+#include "metrics.h"
+#include "prefix_cache.h"
 #include "request.h"
 #include "request_state.h"
 
@@ -15,41 +19,6 @@ namespace llm {
 namespace serve {
 
 using namespace tvm::runtime;
-
-/*! \brief Runtime statistics of engine. */
-struct EngineStats {
-  /*! \brief The sum of "prefill time of each request". */
-  double request_total_prefill_time = 0.0f;
-  /*! \brief The sum of "decode time of each request". */
-  double request_total_decode_time = 0.0f;
-  /*! \brief The total engine time on prefill. */
-  double engine_total_prefill_time = 0.0f;
-  /*! \brief The total engine time on decode. */
-  double engine_total_decode_time = 0.0f;
-  /*! \brief The total number of processed tokens in prefill. */
-  int64_t total_prefill_length = 0;
-  /*! \brief The total number of processed tokens in decode. */
-  int64_t total_decode_length = 0;
-  /*! \brief The total number of accepted tokens in speculation verification. */
-  int64_t total_accepted_length = 0;
-  /*! \brief The total number of speculated draft tokens. */
-  int64_t total_draft_length = 0;
-
-  /*!
-   * \brief Return the engine runtime statistics in JSON string.
-   * We collect the following entries:
-   * - single token prefill latency (s/tok): avg latency of processing one token in prefill
-   * - single token decode latency (s/tok): avg latency of processing one token in decode
-   * - engine time for prefill (sec)
-   * - engine time for decode (sec)
-   * - total number of processed tokens in prefill.
-   * - total number of processed tokens in decode.
-   * \return The statistics in JSON string.
-   */
-  String AsJSON() const;
-  /*! \brief Reset all the statistics. */
-  void Reset();
-};
 
 /*! \brief The manager of internal id for requests in engine. */
 struct EngineInternalIDManager {
@@ -91,10 +60,12 @@ class EngineStateObj : public Object {
   std::unordered_map<String, RequestState> request_states;
   /*! \brief The internal id manager. */
   EngineInternalIDManager id_manager;
-  /*! \brief Runtime statistics. */
-  EngineStats stats;
+  /*! \brief Runtime metrics. */
+  EngineMetrics metrics;
+  /*! \brief The prefix cache. */
+  PrefixCache prefix_cache{nullptr};
 
-  /*! \brief Reset the engine state and clear the statistics. */
+  /*! \brief Reset the engine state and clear the metrics. */
   void Reset();
   /*! \brief Get the request state of the given request. */
   RequestState GetRequestState(Request request);

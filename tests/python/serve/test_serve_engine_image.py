@@ -1,8 +1,9 @@
 import json
 from pathlib import Path
 
-from mlc_llm.serve import GenerationConfig, data
-from mlc_llm.serve.sync_engine import SyncEngine
+from mlc_llm.protocol.generation_config import GenerationConfig
+from mlc_llm.serve import data
+from mlc_llm.serve.sync_engine import EngineConfig, SyncMLCEngine
 
 
 def get_test_image(config) -> data.ImageData:
@@ -12,12 +13,12 @@ def get_test_image(config) -> data.ImageData:
 def test_engine_generate():
     # Create engine
     model = "dist/llava-1.5-7b-hf-q4f16_1-MLC/params"
-    model_lib_path = "dist/llava-1.5-7b-hf-q4f16_1-MLC/llava-1.5-7b-hf-q4f16_1-MLC.so"
-    engine = SyncEngine(
+    model_lib = "dist/llava-1.5-7b-hf-q4f16_1-MLC/llava-1.5-7b-hf-q4f16_1-MLC.so"
+    engine = SyncMLCEngine(
         model=model,
-        model_lib_path=model_lib_path,
+        model_lib=model_lib,
         mode="server",
-        max_total_sequence_length=4096,
+        engine_config=EngineConfig(max_total_sequence_length=4096),
     )
     max_tokens = 256
 

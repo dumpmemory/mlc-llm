@@ -1,9 +1,11 @@
 # pylint: disable=chained-comparison,line-too-long,missing-docstring,
-# pylint: disable=too-many-arguments,too-many-locals,unused-argument,unused-variable
+# pylint: disable=too-many-arguments,too-many-locals
 import asyncio
 from typing import List
 
-from mlc_llm.serve import AsyncEngine, EngineConfig, GenerationConfig, SpeculativeMode
+from mlc_llm.protocol.generation_config import GenerationConfig
+from mlc_llm.serve import AsyncMLCEngine, EngineConfig
+from mlc_llm.testing import require_test_model
 
 prompts = [
     "What is the meaning of life?",
@@ -19,20 +21,19 @@ prompts = [
 ]
 
 
-async def test_engine_generate():
+@require_test_model(
+    "Llama-2-7b-chat-hf-q0f16-MLC",
+    "Llama-2-7b-chat-hf-q4f16_1-MLC",
+)
+async def test_engine_generate(model: str, small_model: str):
     # Create engine
-    model = "dist/Llama-2-7b-chat-hf-q0f16-MLC"
-    model_lib_path = "dist/Llama-2-7b-chat-hf-q0f16-MLC/Llama-2-7b-chat-hf-q0f16-MLC-cuda.so"
-    small_model = "dist/Llama-2-7b-chat-hf-q4f16_1-MLC"
-    small_model_lib_path = (
-        "dist/Llama-2-7b-chat-hf-q4f16_1-MLC/Llama-2-7b-chat-hf-q4f16_1-MLC-cuda.so"
-    )
-    async_engine = AsyncEngine(
+    async_engine = AsyncMLCEngine(
         model=model,
-        model_lib_path=model_lib_path,
         mode="server",
-        additional_models=[small_model + ":" + small_model_lib_path],
-        engine_config=EngineConfig(speculative_mode=SpeculativeMode.SMALL_DRAFT),
+        engine_config=EngineConfig(
+            additional_models=[small_model],
+            speculative_mode="small_draft",
+        ),
     )
 
     num_requests = 10
@@ -44,7 +45,7 @@ async def test_engine_generate():
     ]
 
     async def generate_task(
-        async_engine: AsyncEngine,
+        async_engine: AsyncMLCEngine,
         prompt: str,
         generation_cfg: GenerationConfig,
         request_id: str,

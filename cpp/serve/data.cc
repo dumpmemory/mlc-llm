@@ -109,7 +109,7 @@ TVM_REGISTER_GLOBAL("mlc.serve.ImageDataGetImage").set_body_typed([](ImageData d
 /*! \brief Convert a single token with probability to JSON string. */
 inline void TokenToLogProbJSON(const Tokenizer& tokenizer, const TokenProbPair& token_prob,
                                std::ostringstream* os) {
-  const std::string& token = tokenizer->TokenTable()[token_prob.first];
+  const std::string& token = tokenizer->PostProcessedTokenTable()[token_prob.first];
 
   (*os) << "\"token\": \"";
   for (char ch : token) {
@@ -137,6 +137,8 @@ inline void TokenToLogProbJSON(const Tokenizer& tokenizer, const TokenProbPair& 
   }
   (*os) << "]";
 }
+
+int32_t SampleResult::GetTokenId() const { return this->sampled_token_id.first; }
 
 std::string SampleResult::GetLogProbJSON(const Tokenizer& tokenizer, bool logprob) const {
   ICHECK(top_prob_tokens.empty() || logprob);
@@ -171,19 +173,32 @@ TVM_REGISTER_OBJECT_TYPE(RequestStreamOutputObj);
 RequestStreamOutput::RequestStreamOutput(
     String request_id, Array<IntTuple> group_delta_token_ids,
     Optional<Array<Array<String>>> group_delta_logprob_json_strs,
-    Array<Optional<String>> group_finish_reason) {
+    Array<Optional<String>> group_finish_reason, Array<String> group_extra_prefix_string) {
   ObjectPtr<RequestStreamOutputObj> n = make_object<RequestStreamOutputObj>();
   n->request_id = std::move(request_id);
   n->group_delta_token_ids = std::move(group_delta_token_ids);
   n->group_delta_logprob_json_strs = std::move(group_delta_logprob_json_strs);
   n->group_finish_reason = std::move(group_finish_reason);
+  n->group_extra_prefix_string = std::move(group_extra_prefix_string);
   data_ = std::move(n);
+}
+
+RequestStreamOutput RequestStreamOutput::Usage(String request_id,
+                                               String request_final_usage_json_str) {
+  ObjectPtr<RequestStreamOutputObj> n = make_object<RequestStreamOutputObj>();
+  n->request_id = std::move(request_id);
+  n->request_final_usage_json_str = std::move(request_final_usage_json_str);
+  return RequestStreamOutput(n);
 }
 
 TVM_REGISTER_GLOBAL("mlc.serve.RequestStreamOutputUnpack")
     .set_body_typed([](RequestStreamOutput output) {
-      return Array<ObjectRef>{output->request_id, output->group_delta_token_ids,
-                              output->group_delta_logprob_json_strs, output->group_finish_reason};
+      return Array<ObjectRef>{output->request_id,
+                              output->group_delta_token_ids,
+                              output->group_delta_logprob_json_strs,
+                              output->group_finish_reason,
+                              output->request_final_usage_json_str,
+                              output->group_extra_prefix_string};
     });
 
 }  // namespace serve

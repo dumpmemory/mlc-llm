@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 class EagleConfig(LlamaConfig):
     """Configuration of the Eagle model."""
 
+    bias: bool = True  # Whether to use bias in the fc layers
+
 
 # pylint: disable=invalid-name,missing-docstring
 
@@ -77,7 +79,7 @@ class EagleForCasualLM(nn.Module):  # pylint: disable=too-many-instance-attribut
             [EagleDecoderLayer(config, i) for i in range(config.num_hidden_layers)]
         )
         self.fc = nn.Linear(
-            in_features=2 * config.hidden_size, out_features=config.hidden_size, bias=True
+            in_features=2 * config.hidden_size, out_features=config.hidden_size, bias=config.bias
         )
 
         self.num_hidden_layers = config.num_hidden_layers
@@ -188,8 +190,8 @@ class EagleForCasualLM(nn.Module):  # pylint: disable=too-many-instance-attribut
                 },
             },
             "fuse_embed_hidden_states": {
-                "input_embed": nn.spec.Tensor(["length", self.hidden_size], self.dtype),
-                "hidden_states": nn.spec.Tensor(["length", self.hidden_size], self.dtype),
+                "input_embed": nn.spec.Tensor(["seq_len", self.hidden_size], self.dtype),
+                "hidden_states": nn.spec.Tensor(["seq_len", self.hidden_size], self.dtype),
                 "$": {
                     "param_mode": "packed",
                     "effect_mode": "none",

@@ -1,4 +1,5 @@
 """A centralized registry of all existing quantization methods and their configurations."""
+
 from typing import Any, Dict
 
 from .awq_quantization import AWQQuantize
@@ -123,10 +124,37 @@ QUANTIZATION: Dict[str, Quantization] = {
         kind="per-tensor-quant",
         activation_dtype="e5m2_float8",
         weight_dtype="e5m2_float8",
-        storage_dtype="uint32",
+        storage_dtype="e5m2_float8",
         model_dtype="float16",
-        quantize_final_fc=True,
+        quantize_final_fc=False,
         quantize_embedding=False,
+        quantize_linear=True,
         use_scale=False,
+    ),
+    "e4m3_e4m3_f16": PerTensorQuantize(
+        name="e4m3_e4m3_f16",
+        kind="per-tensor-quant",
+        activation_dtype="e4m3_float8",
+        weight_dtype="e4m3_float8",
+        storage_dtype="e4m3_float8",
+        model_dtype="float16",
+        quantize_final_fc=False,
+        quantize_embedding=False,
+        quantize_linear=True,
+        use_scale=True,
+        calibration_mode="inference",
+    ),
+    "e4m3_e4m3_f16_max_calibrate": PerTensorQuantize(
+        name="e4m3_e4m3_f16_max_calibrate",
+        kind="per-tensor-quant",
+        activation_dtype="e4m3_float8",
+        weight_dtype="e4m3_float8",
+        storage_dtype="e4m3_float8",
+        model_dtype="float16",
+        quantize_final_fc=False,
+        quantize_embedding=False,
+        quantize_linear=True,
+        use_scale=True,
+        calibration_mode="max",
     ),
 }

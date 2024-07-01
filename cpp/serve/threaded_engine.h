@@ -6,6 +6,7 @@
 #ifndef MLC_LLM_SERVE_THREADED_ENGINE_H_
 #define MLC_LLM_SERVE_THREADED_ENGINE_H_
 
+#include <picojson.h>
 #include <tvm/runtime/packed_func.h>
 
 #include "data.h"
@@ -35,9 +36,24 @@ class ThreadedEngine {
 
   /*!
    * \brief Initialize the threaded engine from packed arguments in TVMArgs.
-   * \param args The arguments of engine construction.
+   * \param device The device where to run models.
+   * \param request_stream_callback The request stream callback function to.
+   * \param trace_recorder Event trace recorder for requests.
    */
-  virtual void InitBackgroundEngine(TVMArgs args) = 0;
+  virtual void InitThreadedEngine(Device device, Optional<PackedFunc> request_stream_callback,
+                                  Optional<EventTraceRecorder> trace_recorder) = 0;
+
+  /*!
+   * \brief Reload the engine with the new engine config.
+   * \param engine_config_json_str The engine config JSON string.
+   */
+  virtual void Reload(String engine_config_json_str) = 0;
+
+  /*! \brief Unload the background engine. */
+  virtual void Unload() = 0;
+
+  /*! \brief Reset the engine to the initial state. */
+  virtual void Reset() = 0;
 
   /*! \brief Starts the background request processing loop. */
   virtual void RunBackgroundLoop() = 0;
@@ -57,6 +73,17 @@ class ThreadedEngine {
 
   /*! \brief Abort the input request (specified by id string) from engine. */
   virtual void AbortRequest(const String& request_id) = 0;
+
+  /************** Query/Profile/Debug **************/
+
+  /*! \brief Return the default generation config. */
+  virtual GenerationConfig GetDefaultGenerationConfig() const = 0;
+
+  /*! \brief Return the complete engine config. */
+  virtual EngineConfig GetCompleteEngineConfig() const = 0;
+
+  /*! \brief Call the given global function on all workers. Only for debug purpose. */
+  virtual void DebugCallFuncOnAllAllWorker(const String& func_name) = 0;
 };
 
 }  // namespace serve

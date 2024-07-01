@@ -2,6 +2,7 @@
  * \file multi_gpu_loader.cc
  * \brief Implementation of a multi-GPU loader with loading-time sharding.
  */
+#ifndef MLC_SINGLE_GPU_ONLY
 #include <picojson.h>
 #include <tvm/runtime/device_api.h>
 #include <tvm/runtime/disco/builtin.h>
@@ -146,10 +147,10 @@ Array<NDArray> LoadMultiGPU(const std::string& model_path, Module relax_vm_modul
       ModelMetadata::FromModule(relax_vm_module, model_config.get<picojson::object>());
   CHECK_EQ(model_metadata.tensor_parallel_shards, num_shards)
       << "ValueError: The model is compiled using `--tensor-parallel-shards="
-      << model_metadata.tensor_parallel_shards << "`, but ChatModule is configured to use "
-      << num_shards << " GPUs. "
-      << "Please use `ChatConfig(tensor_parallel_shards=" << model_metadata.tensor_parallel_shards
-      << ", ...)` to initialize ChatModule.";
+      << model_metadata.tensor_parallel_shards
+      << "`, but mlc-chat-config.json is configured to use " << num_shards << " GPUs. "
+      << "Please set \"tensor_parallel_shards\" in mlc-chat-config.json to "
+      << model_metadata.tensor_parallel_shards;
   // Step 1. Extract auxiliary information
   PreprocessorPool preprocs(model_metadata, relax_vm_module);
   std::unordered_map<std::string, ModelMetadata::Param> param_name2info;
@@ -265,3 +266,5 @@ TVM_REGISTER_GLOBAL("mlc.loader.LoadMultiGPUPresharded").set_body_typed(LoadMult
 }  // namespace loader
 }  // namespace llm
 }  // namespace mlc
+
+#endif  // MLC_SINGLE_GPU_ONLY

@@ -11,7 +11,7 @@
 #include <tvm/runtime/object.h>
 #include <tvm/runtime/packed_func.h>
 
-#include "../tokenizers.h"
+#include "../tokenizers/tokenizers.h"
 #include "config.h"
 #include "data.h"
 
@@ -43,11 +43,11 @@ class RequestNode : public Object {
    */
   Array<Data> inputs;
   /*!
-   * \brief The equivalent total input sequence length of the request.
-   * "-1" means the total input length is unknown due to the existence
+   * \brief The equivalent input sequence length of the request.
+   * "-1" means the input length is unknown due to the existence
    * of untokenized text data.
    */
-  int input_total_length = -1;
+  int prompt_tokens = -1;
   /*!
    * \brief The sampling configuration which may contain temperature,
    * top_p, repetition_penalty, max_gen_len, etc.

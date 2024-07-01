@@ -21,6 +21,18 @@ using namespace tvm::runtime;
 
 typedef TypedPackedFunc<void(Array<RequestStreamOutput>)> FRequestStreamCallback;
 
+class Engine;
+
+/*!
+ * \brief The output of engine creation, including the created engine and
+ * the default generation config for requests.
+ */
+struct EngineCreationOutput {
+  std::unique_ptr<Engine> reloaded_engine;
+  EngineConfig completed_engine_config;
+  GenerationConfig default_generation_cfg;
+};
+
 /*!
  * \brief The engine interface for request serving in MLC LLM.
  * The engine can run one or multiple LLM models internally for
@@ -50,41 +62,28 @@ class Engine {
 
   /*!
    * \brief Create an engine in unique pointer.
-   * \param max_single_sequence_length The maximum allowed single
-   * sequence length supported by the engine.
-   * \param tokenizer_path The tokenizer path on disk.
-   * \param kv_cache_config_json_str The KV cache config in JSON string.
-   * \param engine_config_json_str The Engine execution configuration in JSON string.
-   * \param request_stream_callback The request stream callback function to
-   * stream back generated output for requests.
+   * \param engine_config_json_str The serialized JSON string of the engine config.
+   * \param device The device where the run models.
+   * \param request_stream_callback The request stream callback function to.
    * \param trace_recorder Event trace recorder for requests.
-   * \param model_infos The model info tuples. Each tuple contains
-   * - the model library, which might be a path to the binary file or
-   * an executable module that is pre-loaded,
-   * - the path to the model weight parameters,
-   * - the device to run the model on.
-   * \return The created Engine in pointer.
+   * \return The created Engine in pointer, and the default generation config.
    */
-  static std::unique_ptr<Engine> Create(
-      int max_single_sequence_length, const String& tokenizer_path,
-      const String& kv_cache_config_json_str, const String& engine_config_json_str,
-      Optional<PackedFunc> request_stream_callback, Optional<EventTraceRecorder> trace_recorder,
-      const std::vector<std::tuple<TVMArgValue, String, DLDevice>>& model_infos);
+  static Result<EngineCreationOutput> Create(const std::string& engine_config_json_str,
+                                             Device device,
+                                             FRequestStreamCallback request_stream_callback,
+                                             Optional<EventTraceRecorder> trace_recorder);
 
-  /*! \brief Reset the engine, clean up all running data and statistics. */
+  /*! \brief Reset the engine, clean up all running data and metrics. */
   virtual void Reset() = 0;
 
   /*! \brief Check if the engine has no request to process. */
   virtual bool Empty() = 0;
 
-  /*! \brief Get the statistics of the Engine in JSON string. */
-  virtual String Stats() = 0;
-
   /*! \brief Get the request stream callback function of the engine. */
-  virtual Optional<PackedFunc> GetRequestStreamCallback() = 0;
+  virtual FRequestStreamCallback GetRequestStreamCallback() = 0;
 
   /*! \brief Set the request stream callback function of the engine. */
-  virtual void SetRequestStreamCallback(Optional<PackedFunc> request_stream_callback) = 0;
+  virtual void SetRequestStreamCallback(FRequestStreamCallback request_stream_callback) = 0;
 
   /***************** High-level Request Management *****************/
 
@@ -93,6 +92,9 @@ class Engine {
 
   /*! \brief Abort the input request (specified by id string) from engine. */
   virtual void AbortRequest(const String& request_id) = 0;
+
+  /*! \brief Abort all requests from the engine. */
+  virtual void AbortAllRequests() = 0;
 
   /*********************** Engine Action ***********************/
 
@@ -107,31 +109,15 @@ class Engine {
    * generation results for those finished requests.
    */
   virtual void Step() = 0;
+
+  /************** Debug/Profile **************/
+
+  /*! \brief Internal engine metrics. */
+  virtual String JSONMetrics() = 0;
+
+  /*! \brief Call the given global function on all workers. Only for debug purpose. */
+  virtual void DebugCallFuncOnAllAllWorker(const String& func_name) = 0;
 };
-
-/*!
- * \brief Create an Engine from packed arguments in TVMArgs.
- * \param args The arguments of engine construction.
- * \return The constructed engine in unique pointer.
- */
-std::unique_ptr<Engine> CreateEnginePacked(TVMArgs args);
-
-constexpr const char* kEngineCreationErrorMessage =
-    "With `n` models, engine initialization "
-    "takes (6 + 4 * n) arguments. The first 6 arguments should be: "
-    "1) (int) maximum length of a sequence, which must be equal or smaller than the context "
-    "window size of each model; "
-    "2) (string) path to tokenizer configuration files, which in MLC LLM, usually in a model "
-    "weights directory; "
-    "3) (string) JSON configuration for the KVCache; "
-    "4) (string) JSON mode for Engine;"
-    "5) (packed function, optional) global request stream callback function. "
-    "6) (EventTraceRecorder, optional) the event trace recorder for requests."
-    "The following (4 * n) arguments, 4 for each model, should be: "
-    "1) (tvm.runtime.Module) The model library loaded into TVM's RelaxVM; "
-    "2) (string) Model path which includes weights and mlc-chat-config.json; "
-    "3) (int, enum DLDeviceType) Device type, e.g. CUDA, ROCm, etc; "
-    "4) (int) Device id, i.e. the ordinal index of the device that exists locally.";
 
 }  // namespace serve
 }  // namespace llm
