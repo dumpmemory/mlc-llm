@@ -20,6 +20,9 @@ from mlc_llm.protocol.openai_api_protocol import (
 class Dataset:  # pylint: disable=too-few-public-methods
     """The dataset base class."""
 
+    # We set a truncation limit of 100k.
+    truncate_length = int(1e5)
+
     def generate_request_records(
         self,
         input_len: Optional[int],
@@ -35,34 +38,61 @@ class ShareGPTDataset(Dataset):  # pylint: disable=too-few-public-methods
     """The dataset class for ShareGPT dataset."""
 
     _tokenized_dataset: List[Tuple[str, List[int], int]]
+    apply_chat_template: bool
 
-    def __init__(self, dataset_path: str, tokenizer: AutoTokenizer) -> None:
+    def __init__(
+        self, dataset_path: str, tokenizer: AutoTokenizer, apply_chat_template: bool
+    ) -> None:
+        self.apply_chat_template = apply_chat_template
         with open(dataset_path, encoding="utf-8") as f:
             raw_dataset = json.load(f)
         # Filter out the conversations with less than 2 turns.
         _dataset = [
             (data["conversations"][0]["value"], data["conversations"][1]["value"])
             for data in raw_dataset
-            if len(data["conversations"]) >= 2
+            if len(data["conversations"]) >= 2 and data["conversations"][0]["from"] == "human"
         ]
         # Tokenize the prompts and completions.
         self.tokenizer = tokenizer
         prompts = [prompt for prompt, _ in _dataset]
+        if apply_chat_template:
+            assert (
+                getattr(tokenizer, "chat_template", None) is not None
+            ), '"--apply-chat-template" is set but the tokenizer does not have chat template.'
+            prompts = [
+                tokenizer.apply_chat_template(
+                    [{"role": "user", "content": prompt}],
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+                for prompt in prompts
+            ]
+
         prompt_token_ids = list(
             tokenizer(
                 prompts,
                 truncation=True,
-                max_length=tokenizer.model_max_length,
+                max_length=min(tokenizer.model_max_length, self.truncate_length),
+                add_special_tokens=False,
             ).input_ids
         )
         completions = [completion for _, completion in _dataset]
         completion_token_ids = tokenizer(
             completions,
             truncation=True,
-            max_length=tokenizer.model_max_length,
+            max_length=min(tokenizer.model_max_length, self.truncate_length),
+            add_special_tokens=False,
         ).input_ids
         self._tokenized_dataset: List[Tuple[str, List[int], int]] = []
         for i in range(len(_dataset)):
+            if (
+                len(prompt_token_ids[i]) < 4
+                or len(completion_token_ids[i]) < 4
+                or len(prompt_token_ids[i]) + len(completion_token_ids[i])
+                >= min(tokenizer.model_max_length, 8192)
+            ):
+                # Filter out sequences that are too short or too long
+                continue
             self._tokenized_dataset.append(
                 (prompts[i], prompt_token_ids[i], len(completion_token_ids[i]))
             )
@@ -74,6 +104,11 @@ class ShareGPTDataset(Dataset):  # pylint: disable=too-few-public-methods
         input_len_std: float = 0.0,
         output_len_std: float = 0.0,
     ) -> List[RequestRecord]:
+        if self.apply_chat_template:
+            assert (
+                input_len is None
+            ), '"--apply-chat-template" is not supported when "--input-len" is specified.'
+
         request_records = []
         for prompt, input_token_ids, output_length in self._tokenized_dataset:
             input_length = len(input_token_ids)
@@ -136,7 +171,8 @@ class LLMPerfDataset(Dataset):  # pylint: disable=too-few-public-methods
         tokenized_data = tokenizer(
             untokenized_data,
             truncation=True,
-            max_length=tokenizer.model_max_length,
+            max_length=min(tokenizer.model_max_length, self.truncate_length),
+            add_special_tokens=False,
         ).input_ids
         tokenized_data_lengths = [len(tokens) for tokens in tokenized_data]
         self.dataset: List[Tuple[str, List[int], int]] = list(
@@ -166,7 +202,9 @@ class LLMPerfDataset(Dataset):  # pylint: disable=too-few-public-methods
                 "Don't generate eos tokens:\n\n"
             )
 
-            remaining_token_length = input_length - len(self.tokenizer.encode(prompt))
+            remaining_token_length = input_length - len(
+                self.tokenizer.encode(prompt, add_special_tokens=False)
+            )
 
             random.shuffle(self.dataset)
 
@@ -216,7 +254,9 @@ class JSONModeEvalDataset(Dataset):  # pylint: disable=too-few-public-methods
             }
             num_tokens = 0
             for message in messages:
-                num_tokens += len(self.tokenizer.encode(message["content"]))
+                num_tokens += len(
+                    self.tokenizer.encode(message["content"], add_special_tokens=False)
+                )
             self.dataset.append((messages, schema, num_tokens))
 
     def generate_request_records(
@@ -466,9 +506,15 @@ def create_dataset(args: argparse.Namespace, tokenizer: AutoTokenizer) -> "Datas
                 'Please specify the dataset kind via "--dataset".'
             )
     if args.dataset == "sharegpt":
-        return ShareGPTDataset(args.dataset_path, tokenizer)
+        return ShareGPTDataset(args.dataset_path, tokenizer, args.apply_chat_template)
     if args.dataset == "llmperf":
+        assert (
+            args.apply_chat_template is False
+        ), "LLMPerf dataset does not support applying chat template"
         return LLMPerfDataset(args.dataset_path, args.num_requests * 4, tokenizer)
     if args.dataset == "json-mode-eval":
+        assert (
+            args.apply_chat_template is False
+        ), "JSON mode evaluation does not support applying chat template"
         return JSONModeEvalDataset(tokenizer)
     raise ValueError(f"Unrecognized dataset {args.dataset}")
